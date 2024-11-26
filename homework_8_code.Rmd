@@ -1,0 +1,279 @@
+---
+title: "Homework 8 Code"
+output:
+  html_document:
+    df_print: paged
+---
+
+Read in and clean data for Problem 1
+
+```{r}
+ncaab_scores <- read.csv("2018_ncaab.csv")
+ncaab_teams <- read.csv("2018_tournament_teams.csv")
+ncaab_teams$team = gsub(" ", ".", ncaab_teams$team)
+ncaab_teams$team = gsub("-", "_", ncaab_teams$team)
+ncaab_teams$team = gsub("&", "", ncaab_teams$team)
+```
+
+Problem 1a
+
+```{r}
+# Create empty data frame for margin of victory, game location, and one column for each team
+ncaab_data = as.data.frame(matrix(nrow = 5406, ncol = 66))
+
+# Identify unique names of all NCAA basketball teams
+teams = ncaab_teams$team
+
+# Replace generic column names in 'ncaab_data' data frame with columns for margin of victory, location, and the team names
+colnames(ncaab_data) = c("MoV", "Location", teams)
+
+# Replace all entries in data frame with 0
+ncaab_data[is.na(ncaab_data)] = 0
+
+# The following loop iterates through all teams.  For each team, the first line sets the value equal to 1 if that team was at home and 0 otherwise.  The second line sets the value equal to -1 if that team was away and 0 otherwise. 
+
+for (i in 1:length(teams)) {
+    home = as.integer(ncaab_scores$home_team == teams[i])
+    away = -1 * as.integer(ncaab_scores$away_team == teams[i])
+    team_locations = home + away
+    ncaab_data[, i + 2] = team_locations
+    # Debugging step: check if any NA values are present
+    if (any(is.na(team_locations))) {
+        warning(paste("NA values detected for team:", teams[i]))
+    }
+}
+
+# Set margin of victory to be home score minus away score
+ncaab_data$MoV = ncaab_scores$home_score - ncaab_scores$away_score
+
+# Set game location to be 1 if the home team was in their home stadium; set equal to 0 if the game was played at a neutral location with a designated home team.  This normally needs to be done manually in practice, but will always be provided for you in the original dataset for the purposes of this course.
+ncaab_data$Location = ncaab_scores$location
+
+ncaab_data[is.na(ncaab_data)] = 0  # Ensure no NAs
+model = lm(MoV ~ 0 + ., data = ncaab_data)  # Fit model
+coefficients = coef(model, complete = TRUE)  # Extract coefficients
+coefficients[is.na(coefficients)] = 0  # Replace NA coefficients
+
+sigma(model)
+
+print(coefficients[1:10])
+```
+
+Problem 1b
+
+```{r}
+# Calculate the amount ratings need to be adjusted by, equal to the sum of the coefficients for the teams that are not the baseline divided by the number of teams in the league
+adjustment = -1 * sum(coefficients[2:length(coefficients)]) / (length(coefficients) - 1)
+
+# Adjust the ratings by adding the adjustment to each team's rating, leaving the intercept alone.  The sum of the coefficients should now be equal to the intercept, meaning the average rating for all teams is 0.
+ratings = c(coefficients[1], coefficients[2:length(coefficients)] + adjustment)
+
+ncaab_teams$ratings <- ratings[2:65]
+```
+
+Problem 1c
+
+```{r}
+# Load necessary library
+library(parallel)
+
+# Set random seed for reproducibility
+set.seed(31)
+
+# Parameters
+iterations <- 10000  # Number of tournament simulations
+num_teams <- 64  # Number of teams in the tournament
+league_sd <- sigma(model)  # Residual standard deviation from the Bradley-Terry model
+
+# Ratings as a named vector for quick lookup
+ratings <- setNames(as.numeric(ratings[ncaab_teams$team]), ncaab_teams$team)
+
+# Initialize results matrix
+results <- matrix(0, nrow = iterations, ncol = num_teams - 1)
+
+# Initialize tournament ratings data frame
+tournament_ratings <- data.frame(
+  team = ncaab_teams$team,
+  seed = ncaab_teams$seed,
+  region = ncaab_teams$region,
+  rating = as.numeric(ratings),
+  R32 = 0, SS = 0, EE = 0, FF = 0, CG = 0, Champ = 0
+)
+
+# Define simulation function
+simulate_tournament <- function() {
+  current_round <- ncaab_teams$team
+  winners <- vector("character", num_teams - 1)
+  game_index <- 1
+  
+  while (length(current_round) > 1) {
+    # Prepare matchups
+    team_1 <- current_round[seq(1, length(current_round), 2)]
+    team_2 <- current_round[seq(2, length(current_round), 2)]
+    
+    # Compute win probabilities
+    win_probs <- 1 - pnorm((0 - (ratings[team_1] - ratings[team_2])) / league_sd)
+    
+    # Small disturbance to prevent ties if needed
+    disturbance <- runif(length(win_probs), min = -1e-10, max = 1e-10)  # tiny random noise
+    win_probs <- win_probs + disturbance
+    
+    # Simulate winners based on probabilities
+    u <- runif(length(win_probs))
+    next_round <- ifelse(u < win_probs, team_1, team_2)
+    
+    # Record winners
+    winners[game_index:(game_index + length(next_round) - 1)] <- next_round
+    game_index <- game_index + length(next_round)
+    current_round <- next_round
+  }
+  
+  return(winners)
+}
+
+# Setup parallel processing
+num_cores <- max(1, detectCores() - 1)  # Use all but one core
+cl <- makeCluster(num_cores)
+
+# Export required objects to the worker nodes
+clusterExport(cl, c("simulate_tournament", "ncaab_teams", "ratings", "league_sd", "num_teams"))
+clusterEvalQ(cl, library(parallel))  # Ensure library is loaded on workers
+
+# Run simulations in parallel
+results <- parLapply(cl, 1:iterations, function(i) simulate_tournament())
+stopCluster(cl)  # Stop the cluster
+
+# Combine results from parallel workers
+results <- do.call(rbind, results)
+
+# Compute advancement probabilities for each round
+round_indices <- list(
+  R32 = 1:32, SS = 33:48, EE = 49:56, FF = 57:60, CG = 61:62, Champ = 63
+)
+
+for (round in names(round_indices)) {
+  tournament_ratings[[round]] <- sapply(
+    tournament_ratings$team,
+    function(team) 100 * sum(results[, round_indices[[round]]] == team) / iterations
+  )
+}
+
+# Finalize and print results
+tournament_ratings <- as.data.frame(tournament_ratings)
+print(tournament_ratings)
+```
+
+Problem 1g
+
+```{r}
+subset_results <- results[results[, 61] == "Michigan" & results[, 62] == "Villanova", ]
+
+num_rows <- nrow(subset_results)
+
+print(num_rows)
+```
+
+Read in data for Problem 2
+
+```{r}
+nba_data <- read.csv("nba_data.csv")
+nba_elos <- read.csv("nba_initial_elos.csv")
+```
+
+Problem 2a
+
+```{r}
+set.seed(37)
+
+# Initialize variables
+num_simulations <- 1000
+teams <- nba_elos$team[1:30]
+num_teams <- length(teams)
+
+# Create results data frame to store simulation outcomes
+results <- data.frame(matrix(0, nrow = num_simulations, ncol = num_teams))
+colnames(results) <- teams
+
+# Example dataset: 'games' data frame with columns 'home_team', 'away_team', 'home_score', 'away_score'
+# Add a column to identify whether the home team won
+nba_data$home_win <- ifelse(nba_data$home_score > nba_data$away_score, 1, 0)
+
+# Calculate win rates for home and away games
+home_win_rate <- mean(nba_data$home_win)  # Proportion of home wins
+away_win_rate <- 1 - home_win_rate     # Proportion of away wins (opposite of home wins)
+
+# Calculate home-field advantage as win rate difference
+home_field_advantage <- home_win_rate - away_win_rate
+print(home_field_advantage)
+
+# Elo parameters
+k_factor <- 15
+home_advantage <- 0.2450062
+
+# Function to calculate win probability using Elo ratings
+calculate_win_prob <- function(elo_team1, elo_team2) {
+  return(1 / (1 + 10 ^ ((elo_team2 - elo_team1) / 400)))
+}
+
+# Simulate the season
+for (sim in 1:num_simulations) {
+  # Copy initial Elo ratings
+  elo_ratings <- nba_elos$rating
+  
+  # Simulate games (every team plays every other team 2 times, home/away)
+  for (i in 1:(num_teams - 1)) {
+    for (j in (i + 1):num_teams) {
+      # Team i hosts team j
+      prob_team_i_wins <- calculate_win_prob(elo_ratings[i] + home_advantage, elo_ratings[j])
+      if (runif(1) < prob_team_i_wins) {
+        results[sim, i] <- results[sim, i] + 1  # Team i wins
+        elo_ratings[i] <- elo_ratings[i] + k_factor * (1 - prob_team_i_wins)
+        elo_ratings[j] <- elo_ratings[j] - k_factor * (1 - prob_team_i_wins)
+      } else {
+        results[sim, j] <- results[sim, j] + 1  # Team j wins
+        elo_ratings[i] <- elo_ratings[i] - k_factor * prob_team_i_wins
+        elo_ratings[j] <- elo_ratings[j] + k_factor * prob_team_i_wins
+      }
+      
+      # Team j hosts team i
+      prob_team_j_wins <- calculate_win_prob(elo_ratings[j] + home_advantage, elo_ratings[i])
+      if (runif(1) < prob_team_j_wins) {
+        results[sim, j] <- results[sim, j] + 1  # Team j wins
+        elo_ratings[j] <- elo_ratings[j] + k_factor * (1 - prob_team_j_wins)
+        elo_ratings[i] <- elo_ratings[i] - k_factor * (1 - prob_team_j_wins)
+      } else {
+        results[sim, i] <- results[sim, i] + 1  # Team i wins
+        elo_ratings[j] <- elo_ratings[j] - k_factor * prob_team_j_wins
+        elo_ratings[i] <- elo_ratings[i] + k_factor * prob_team_j_wins
+      }
+    }
+  }
+}
+
+# Print the results data frame
+print(results)
+```
+
+Problem 2b
+
+```{r}
+
+```
+
+Read in data for Problem 3
+
+```{r}
+
+```
+
+Problem 3a
+
+```{r}
+
+```
+
+Problem 3b
+
+```{r}
+
+```
